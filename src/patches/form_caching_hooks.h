@@ -69,6 +69,10 @@ namespace Patches::FormCaching
         // first GetFormByNumericId call that sees a non-null form map.
         inline std::atomic<void*> g_formMapInner{ nullptr };
 
+        // NKNOVA v3 state used by early loading hooks.
+        inline std::atomic<bool> g_loadOrderTxtParsed{false};
+        inline std::atomic<bool> g_loadOrderCompileComplete{false};
+
         inline SafetyHookInline g_hk_SetAtA{};
         inline SafetyHookInline g_hk_SetAtB{};
 
@@ -735,9 +739,7 @@ namespace Patches::FormCaching
         // NKNOVA v3: canonical MO2 load order. Fluorine exposes this as
         // %LOCALAPPDATA%\\Skyrim Special Edition\\loadorder.txt.
         inline std::vector<std::string> g_loadOrderNames;  // lowercase, exact MO2 order
-        inline std::atomic<bool> g_loadOrderTxtParsed{false};
         inline std::atomic<bool> g_loadOrderTxtLoaded{false};
-        inline std::atomic<bool> g_loadOrderCompileComplete{false};
 
         inline void EnsurePluginsTxtLoaded()
         {
