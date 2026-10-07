@@ -388,17 +388,42 @@ namespace Patches::FormCaching
         {
             if (!a_form) {
                 g_addFormNullCalls.fetch_add(1, std::memory_order_relaxed);
-            } else {
-                auto count = g_addFormCalls.fetch_add(1, std::memory_order_relaxed);
-                // Log the first 20 forms added, then every 10000th
-                if (count < 20 || (count > 0 && count % 10000 == 0)) {
-                    auto formId = a_form->GetFormID();
-                    auto formType = static_cast<std::uint8_t>(a_form->GetFormType());
-                    logger::info("  AddForm #{}: formID=0x{:08X} type=0x{:02X}",
-                        count + 1, formId, formType);
+                return g_hk_AddFormToDataHandler.call<bool>(a_self, a_form);
+            }
+
+            auto count = g_addFormCalls.fetch_add(1, std::memory_order_relaxed);
+            auto formId = a_form->GetFormID();
+            auto formType = static_cast<std::uint8_t>(a_form->GetFormType());
+
+            // Log the first 20 forms added, then every 10000th
+            if (count < 20 || (count > 0 && count % 10000 == 0)) {
+                logger::info("  AddForm #{}: formID=0x{:08X} type=0x{:02X}",
+                    count + 1, formId, formType);
+            }
+
+            const bool result = g_hk_AddFormToDataHandler.call<bool>(a_self, a_form);
+
+            // NKNOVA stability patch v2:
+            // The SetAt hooks are disabled because g_hk_SetAtB deterministically
+            // crashes on this Wine/Proton load order. Keep the authoritative
+            // form cache complete by caching every successfully registered form
+            // here instead. AddFormToDataHandler is the canonical load path for
+            // ESM/ESP forms and is already hooked for the 600-file workaround.
+            if (result) {
+                const std::uint8_t masterId = (formId & 0xFF000000) >> 24;
+                const std::uint32_t baseId = (formId & 0x00FFFFFF);
+                auto& shard = g_formCache[masterId];
+                {
+                    std::unique_lock lock(shard.mutex);
+                    shard.map.insert_or_assign(baseId, a_form);
+                }
+
+                if (formId == 0x000001F4) {
+                    logger::info("NKNOVA cache seed: cached Skyrim.esm Unarmed form 0x000001F4");
                 }
             }
-            return g_hk_AddFormToDataHandler.call<bool>(a_self, a_form);
+
+            return result;
         }
 
         // ================================================================
