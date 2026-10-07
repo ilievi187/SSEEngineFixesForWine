@@ -1,0 +1,49 @@
+name: NKNOVA SE Build
+
+on:
+  workflow_dispatch:
+
+env:
+  BUILD_TYPE: Release
+
+jobs:
+  build-se:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgGitCommitId: '4bb07a326d9b9bce3703272a509e5bc25dd9cfd5'
+
+      - name: Configure CMake
+        shell: pwsh
+        run: >
+          cmake -B build
+          -DCMAKE_BUILD_TYPE=Release
+          -DVCPKG_TARGET_TRIPLET=x64-windows-static
+          -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake"
+          -DCOPY_BUILD=OFF
+          -DBUILD_SKYRIMAE=OFF
+
+      - name: Build
+        shell: pwsh
+        run: cmake --build build --config Release
+
+      - name: Stage artifact
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force artifact/SKSE/Plugins | Out-Null
+          Copy-Item build/Release/0_SSEEngineFixesForWine.dll artifact/SKSE/Plugins/
+          if (Test-Path build/Release/0_SSEEngineFixesForWine.pdb) {
+            Copy-Item build/Release/0_SSEEngineFixesForWine.pdb artifact/SKSE/Plugins/
+          }
+          Copy-Item SSEEngineFixesForWine.toml artifact/SKSE/Plugins/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NKNOVA-SSEEngineFixesForWine-SE
+          path: artifact/
