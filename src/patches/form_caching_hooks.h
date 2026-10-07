@@ -686,17 +686,12 @@ namespace Patches::FormCaching
             //   AE 13785 at 0x1BE460: 3 OpenTES calls = HotLoadPlugin (irrelevant)
             // See ForceLoadAllForms() for the actual fix.
 
-            // v1.22.82: BSTHashMap::SetAt serialization — prevents circular bucket chains
-            // under Wine's threading model. Both template variants share a single spinlock.
-            {
-                auto base = REL::Module::get().base();
-                g_hk_SetAtA = safetyhook::create_inline(
-                    reinterpret_cast<void*>(base + 0x1945D0), BSTHashMap_SetAt_A);
-                g_hk_SetAtB = safetyhook::create_inline(
-                    reinterpret_cast<void*>(base + 0x1947C0), BSTHashMap_SetAt_B);
-            }
-            logger::info("form caching: BSTHashMap::SetAt spinlock hooks installed at +0x1945D0, +0x1947C0 (A={}, B={})"sv,
-                static_cast<bool>(g_hk_SetAtA), static_cast<bool>(g_hk_SetAtB));
+            // NKNOVA stability patch: keep FormCaching and the 600-file/manual compile
+            // workaround enabled, but do NOT install the two BSTHashMap::SetAt inline
+            // hooks. On this Wine/Proton load order they deterministically crash at
+            // AddCompileIndex #5600001 inside g_hk_SetAtB after plugin loading completes.
+            // The rest of FormCaching::Install() remains unchanged.
+            logger::info("form caching: BSTHashMap::SetAt spinlock hooks DISABLED by NKNOVA stability patch"sv);
         }
 
         // Cached plugins.txt data (parsed once, reused across idempotent calls)
