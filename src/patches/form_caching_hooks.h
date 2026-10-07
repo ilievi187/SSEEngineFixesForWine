@@ -350,6 +350,7 @@ namespace Patches::FormCaching
             // again if kDataLoaded fires during the reload.
             logger::info(">>> Post-ClearData: recompiling plugins for Wine reload");
             g_addFormCalls.store(0, std::memory_order_relaxed);
+            g_loadOrderCompileComplete.store(false, std::memory_order_release);
             ManuallyCompileFiles();
             logger::info(">>> Post-ClearData: recompilation done");
         }
@@ -571,6 +572,12 @@ namespace Patches::FormCaching
 
                         ManuallyCompileFiles();
 
+                        if (g_loadOrderTxtParsed.load(std::memory_order_acquire) &&
+                            !g_loadOrderCompileComplete.load(std::memory_order_acquire)) {
+                            logger::info("NKNOVA v3: compile trigger deferred until full loadorder catalog is available");
+                            return;
+                        }
+
                         s_firstCompileDone = true;
                         s_lastCompileAtClose = count;
 
@@ -725,6 +732,13 @@ namespace Patches::FormCaching
         inline std::atomic<bool> g_pluginsTxtParsed{false};
         inline std::atomic<bool> g_pluginsTxtLoaded{false};
 
+        // NKNOVA v3: canonical MO2 load order. Fluorine exposes this as
+        // %LOCALAPPDATA%\\Skyrim Special Edition\\loadorder.txt.
+        inline std::vector<std::string> g_loadOrderNames;  // lowercase, exact MO2 order
+        inline std::atomic<bool> g_loadOrderTxtParsed{false};
+        inline std::atomic<bool> g_loadOrderTxtLoaded{false};
+        inline std::atomic<bool> g_loadOrderCompileComplete{false};
+
         inline void EnsurePluginsTxtLoaded()
         {
             if (g_pluginsTxtLoaded.load(std::memory_order_acquire)) return;
@@ -776,6 +790,58 @@ namespace Patches::FormCaching
                 g_pluginsTxtParsed.load(std::memory_order_relaxed), g_enabledNames.size(), g_disabledNames.size());
         }
 
+        inline void EnsureLoadOrderTxtLoaded()
+        {
+            if (g_loadOrderTxtLoaded.load(std::memory_order_acquire)) return;
+            g_loadOrderTxtLoaded.store(true, std::memory_order_release);
+
+            WCHAR localAppData[MAX_PATH] = {};
+            HRESULT hr = SHGetFolderPathW(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, localAppData);
+            if (hr != S_OK) return;
+
+            std::wstring loadOrderPath = localAppData;
+            loadOrderPath += L"\\Skyrim Special Edition\\loadorder.txt";
+
+            HANDLE hFile = CreateFileW(loadOrderPath.c_str(), GENERIC_READ,
+                FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+
+            if (hFile == INVALID_HANDLE_VALUE) {
+                logger::warn("NKNOVA v3: loadorder.txt not found; falling back to catalog order");
+                return;
+            }
+
+            DWORD fileSize = GetFileSize(hFile, NULL);
+            if (fileSize > 0 && fileSize < 10 * 1024 * 1024) {
+                std::vector<char> buf(fileSize + 1, 0);
+                DWORD bytesRead = 0;
+                if (ReadFile(hFile, buf.data(), fileSize, &bytesRead, NULL) && bytesRead > 0) {
+                    std::string content(buf.data(), bytesRead);
+                    std::istringstream stream(content);
+                    std::string line;
+                    while (std::getline(stream, line)) {
+                        if (!line.empty() && line.back() == '\r') line.pop_back();
+                        if (line.size() >= 3 &&
+                            static_cast<unsigned char>(line[0]) == 0xEF &&
+                            static_cast<unsigned char>(line[1]) == 0xBB &&
+                            static_cast<unsigned char>(line[2]) == 0xBF) {
+                            line.erase(0, 3);
+                        }
+                        if (line.empty() || line[0] == '#') continue;
+                        std::transform(line.begin(), line.end(), line.begin(),
+                            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                        g_loadOrderNames.push_back(std::move(line));
+                    }
+                    if (!g_loadOrderNames.empty())
+                        g_loadOrderTxtParsed.store(true, std::memory_order_release);
+                }
+            }
+            CloseHandle(hFile);
+
+            logger::info("NKNOVA v3: loadorder.txt parsed={}, {} entries",
+                g_loadOrderTxtParsed.load(std::memory_order_relaxed), g_loadOrderNames.size());
+        }
+
         // Manual compilation: assign compile indices to all enabled files
         // and populate compiledFileCollection. This replicates what the
         // engine's CompileFiles does when it doesn't skip.
@@ -798,8 +864,115 @@ namespace Patches::FormCaching
 
             // Parse plugins.txt once (cached for subsequent calls)
             EnsurePluginsTxtLoaded();
+            EnsureLoadOrderTxtLoaded();
 
-            // --- Find current max compile indices (for idempotent re-entry) ---
+            // NKNOVA v3: the TESDataHandler catalog order is NOT the plugin load
+            // order under Fluorine VFS. Assigning indices in catalog order produced
+            // Skyrim.esm=0xA3 instead of 0x00 and broke TESDataHandler::LookupForm.
+            // Wait until every loadorder.txt entry has been cataloged, then assign
+            // all regular/ESL indices in the exact MO2 order in one main-thread pass.
+            if (g_loadOrderTxtParsed.load(std::memory_order_acquire)) {
+                if (g_loadOrderCompileComplete.load(std::memory_order_acquire)) {
+                    tdh->loadingFiles = true;
+                    return;
+                }
+
+                std::unordered_map<std::string, RE::TESFile*> fileByName;
+                fileByName.reserve(g_loadOrderNames.size() + 64);
+                for (auto& file : tdh->files) {
+                    if (!file) continue;
+                    std::string name(file->fileName);
+                    std::transform(name.begin(), name.end(), name.begin(),
+                        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                    fileByName.insert_or_assign(std::move(name), file);
+                }
+
+                std::size_t missing = 0;
+                for (const auto& name : g_loadOrderNames) {
+                    if (!fileByName.contains(name))
+                        ++missing;
+                }
+
+                if (missing != 0) {
+                    logger::info("NKNOVA v3: waiting for full catalog — {} / {} loadorder entries present ({} missing)",
+                        g_loadOrderNames.size() - missing, g_loadOrderNames.size(), missing);
+                    return;
+                }
+
+                // Native CompileFiles was skipped (0 AddCompileIndex calls), so reset
+                // any catalog-time placeholders and rebuild both collections exactly.
+                tdh->compiledFileCollection.files.clear();
+                tdh->compiledFileCollection.smallFiles.clear();
+                for (auto& file : tdh->files) {
+                    if (!file) continue;
+                    file->compileIndex = 0xFF;
+                    file->smallFileCompileIndex = 0;
+                }
+
+                std::uint8_t nextRegIdx = 0;
+                std::uint16_t nextEslIdx = 0;
+                std::size_t regCount = 0;
+                std::size_t eslCount = 0;
+                std::size_t skippedDisabled = 0;
+
+                for (const auto& lowerName : g_loadOrderNames) {
+                    auto it = fileByName.find(lowerName);
+                    if (it == fileByName.end() || !it->second)
+                        continue;
+
+                    RE::TESFile* file = it->second;
+
+                    bool shouldCompile = true;
+                    if (g_pluginsTxtParsed.load(std::memory_order_acquire)) {
+                        const bool isEnabled = g_enabledNames.count(lowerName) > 0;
+                        const bool isDisabled = g_disabledNames.count(lowerName) > 0;
+                        shouldCompile = isEnabled || !isDisabled;
+                    }
+
+                    if (!shouldCompile) {
+                        ++skippedDisabled;
+                        continue;
+                    }
+
+                    if (file->IsLight()) {
+                        if (nextEslIdx > 0xFFF) {
+                            logger::error("NKNOVA v3: ESL limit exceeded at '{}'", file->fileName);
+                            continue;
+                        }
+                        file->compileIndex = 0xFE;
+                        file->smallFileCompileIndex = nextEslIdx++;
+                        tdh->compiledFileCollection.smallFiles.push_back(file);
+                        ++eslCount;
+                    } else {
+                        if (nextRegIdx > 0xFD) {
+                            logger::error("NKNOVA v3: regular plugin limit exceeded at '{}'", file->fileName);
+                            continue;
+                        }
+                        file->compileIndex = nextRegIdx++;
+                        file->smallFileCompileIndex = 0;
+                        tdh->compiledFileCollection.files.push_back(file);
+                        ++regCount;
+                    }
+                }
+
+                tdh->loadingFiles = true;
+                g_loadOrderCompileComplete.store(true, std::memory_order_release);
+
+                logger::info("NKNOVA v3: canonical compile complete — {} reg + {} ESL, {} disabled",
+                    regCount, eslCount, skippedDisabled);
+
+                for (const char* baseName : { "skyrim.esm", "update.esm", "dawnguard.esm", "hearthfires.esm", "dragonborn.esm" }) {
+                    auto it = fileByName.find(baseName);
+                    if (it != fileByName.end() && it->second) {
+                        logger::info("NKNOVA v3 index check: '{}' = 0x{:02X} / small 0x{:04X}",
+                            it->second->fileName, it->second->compileIndex, it->second->smallFileCompileIndex);
+                    }
+                }
+
+                return;
+            }
+
+            // --- Find current max compile indices (fallback when loadorder.txt is unavailable) ---
             std::uint8_t nextRegIdx = 0;
             std::uint16_t nextEslIdx = 0;
 
